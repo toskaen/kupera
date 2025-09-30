@@ -11,8 +11,8 @@ This simulates the covenant logic that would run on-chain.
 """
 
 from decimal import Decimal, getcontext
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, asdict
+from typing import Dict, Optional, Tuple, List
 from uuid import uuid4
 
 getcontext().prec = 28
@@ -52,7 +52,7 @@ class PoolState:
         return Decimal("0.0625") <= self.debt_ratio <= Decimal("0.53125")
     
     @property
-    def arbitrage_opportunity(self) -> Optional[str]:
+    def arbitrage_signal(self) -> Optional[str]:
         """Check if leverage ratio makes arbitrage profitable."""
         target = Decimal("0.50")
         deviation = abs(self.debt_ratio - target)
@@ -63,6 +63,21 @@ class PoolState:
             else:
                 return f"BELOW_TARGET: Ratio {self.debt_ratio:.4f} < {target:.4f}. Profitable to BORROW more."
         return None
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "lbtc_reserve": str(self.lbtc_reserve),
+            "lusdt_reserve": str(self.lusdt_reserve),
+            "debt_amount": str(self.debt_amount),
+            "btc_price": str(self.btc_price),
+            "lp_supply": str(self.lp_supply),
+            "pool_value_usd": str(self.pool_value_usd),
+            "debt_ratio": str(self.debt_ratio),
+            "leverage_multiplier": str(self.leverage_multiplier),
+            "is_healthy": self.is_healthy,
+            "arbitrage_signal": self.arbitrage_signal,
+        }
 
 
 @dataclass
@@ -75,6 +90,17 @@ class SwapQuote:
     fee_paid: Decimal
     price_after: Decimal
     new_state: PoolState
+    
+    def to_payload(self) -> Dict:
+        """Convert to JSON-serializable payload."""
+        return {
+            "input_asset": self.input_asset,
+            "output_asset": self.output_asset,
+            "amount_in": str(self.amount_in),
+            "amount_out": str(self.amount_out),
+            "fee_paid": str(self.fee_paid),
+            "price_after": str(self.price_after),
+        }
 
 
 @dataclass
@@ -84,7 +110,47 @@ class FlashLoanTerms:
     borrow_asset: str
     borrow_amount: Decimal
     repay_amount: Decimal
+    repay_asset: str  # Same as borrow_asset
     fee_amount: Decimal
+    purpose: str = "arbitrage"
+    
+    def to_payload(self) -> Dict:
+        """Convert to JSON-serializable payload."""
+        return {
+            "loan_id": self.loan_id,
+            "borrow_asset": self.borrow_asset,
+            "borrow_amount": str(self.borrow_amount),
+            "repay_amount": str(self.repay_amount),
+            "repay_asset": self.repay_asset,
+            "fee_amount": str(self.fee_amount),
+            "purpose": self.purpose,
+        }
+
+
+@dataclass
+class ArbitrageOpportunity:
+    """Detected arbitrage opportunity."""
+    direction: str  # "buy_btc" or "sell_btc"
+    pool_price: Decimal
+    market_price: Decimal
+    price_deviation_pct: Decimal
+    borrow_asset: str
+    borrow_amount: Decimal
+    expected_profit: Decimal
+    leverage_impact: str
+    
+    def to_summary(self) -> Dict:
+        """Convert to summary dict."""
+        return {
+            "direction": self.direction,
+            "pool_price": str(self.pool_price),
+            "market_price": str(self.market_price),
+            "price_deviation": f"{self.price_deviation_pct * 100:.2f}%",
+            "borrow_asset": self.borrow_asset,
+            "borrow_amount": str(self.borrow_amount),
+            "expected_profit": str(self.expected_profit),
+            "leverage_impact": self.leverage_impact,
+        }
 
 
 class YieldBasisAMM:
@@ -124,6 +190,12 @@ class YieldBasisAMM:
         self.lbtc_reserve = Decimal(initial_lbtc)
         self.lusdt_reserve = Decimal(initial_lusdt)
         
+        # Use reserves dict for compatibility
+        self.reserves = {
+            "LBTC": self.lbtc_reserve,
+            "LUSDt": self.lusdt_reserve,
+        }
+        
         # Calculate initial debt for 50% ratio (2x leverage)
         initial_value = (self.lbtc_reserve * Decimal(btc_price)) + self.lusdt_reserve
         self.debt_amount = initial_value * Decimal("0.5")
@@ -154,6 +226,10 @@ class YieldBasisAMM:
             lp_supply=self.lp_supply,
         )
     
+    def get_leverage_state(self) -> PoolState:
+        """Alias for get_state() for API compatibility."""
+        return self.get_state()
+    
     def invariant(self) -> Decimal:
         """Constant product invariant k = x * y."""
         return self.lbtc_reserve * self.lusdt_reserve
@@ -163,6 +239,13 @@ class YieldBasisAMM:
         if self.lbtc_reserve == 0:
             return Decimal(0)
         return self.lusdt_reserve / self.lbtc_reserve
+    
+    def snapshot(self) -> Dict[str, Decimal]:
+        """Get current reserves snapshot."""
+        return {
+            "LBTC": self.lbtc_reserve,
+            "LUSDt": self.lusdt_reserve,
+        }
     
     # ========================================================================
     # SWAP OPERATIONS (Standard AMM)
@@ -250,9 +333,9 @@ class YieldBasisAMM:
             self.lbtc_reserve -= quote.amount_out
             self.accumulated_fees["LUSDt"] += quote.fee_paid
         
-        # Verify covenant: new_k >= old_k (due to fees)
-        new_k = self.invariant()
-        # In production, covenant would reject if this fails
+        # Sync reserves dict
+        self.reserves["LBTC"] = self.lbtc_reserve
+        self.reserves["LUSDt"] = self.lusdt_reserve
         
         return quote
     
@@ -293,6 +376,10 @@ class YieldBasisAMM:
         self.lusdt_reserve += lusdt_amount
         self.lp_supply += lp_tokens
         
+        # Sync reserves dict
+        self.reserves["LBTC"] = self.lbtc_reserve
+        self.reserves["LUSDt"] = self.lusdt_reserve
+        
         return lp_tokens
     
     def remove_liquidity(self, lp_tokens: Decimal) -> Tuple[Decimal, Decimal]:
@@ -316,13 +403,22 @@ class YieldBasisAMM:
         self.lusdt_reserve -= lusdt_out
         self.lp_supply -= lp_tokens
         
+        # Sync reserves dict
+        self.reserves["LBTC"] = self.lbtc_reserve
+        self.reserves["LUSDt"] = self.lusdt_reserve
+        
         return (lbtc_out, lusdt_out)
     
     # ========================================================================
     # FLASH LOAN OPERATIONS (Enables permissionless rebalancing)
     # ========================================================================
     
-    def prepare_flashloan(self, asset: str, amount: Decimal) -> FlashLoanTerms:
+    def prepare_flashloan(
+        self, 
+        asset: str, 
+        amount: Decimal,
+        purpose: str = "arbitrage"
+    ) -> FlashLoanTerms:
         """
         Prepare flash loan terms (anyone can request).
         
@@ -359,7 +455,9 @@ class YieldBasisAMM:
             borrow_asset=asset,
             borrow_amount=amount,
             repay_amount=repay,
+            repay_asset=asset,
             fee_amount=fee,
+            purpose=purpose,
         )
         
         self.active_loans[loan_id] = terms
@@ -391,6 +489,123 @@ class YieldBasisAMM:
     def cancel_flashloan(self, loan_id: str):
         """Cancel flash loan if not executed."""
         self.active_loans.pop(loan_id, None)
+    
+    # ========================================================================
+    # ARBITRAGE DETECTION & PLANNING
+    # ========================================================================
+    
+    def arbitrage_opportunity(
+        self, 
+        market_price: Decimal, 
+        tolerance: Decimal
+    ) -> Optional[ArbitrageOpportunity]:
+        """
+        Detect arbitrage opportunity between pool and market price.
+        
+        Returns ArbitrageOpportunity if profitable, None otherwise.
+        """
+        pool_price = self.price()
+        price_diff = abs(pool_price - market_price)
+        deviation = price_diff / market_price
+        
+        if deviation <= tolerance:
+            return None
+        
+        state = self.get_state()
+        
+        # Determine direction and asset to borrow
+        if pool_price > market_price:
+            # Pool overvalues BTC → sell BTC in pool (need USDT)
+            direction = "sell_btc"
+            borrow_asset = "LUSDt"
+            # Estimate borrow amount (simplified)
+            borrow_amount = min(
+                self.lusdt_reserve * Decimal("0.1"),
+                price_diff * self.lbtc_reserve * Decimal("0.5")
+            )
+        else:
+            # Pool undervalues BTC → buy BTC in pool (need BTC or USDT for swap)
+            direction = "buy_btc"
+            borrow_asset = "LUSDt"
+            borrow_amount = min(
+                self.lusdt_reserve * Decimal("0.1"),
+                price_diff * self.lbtc_reserve * Decimal("0.5")
+            )
+        
+        # Estimate profit (simplified - actual profit depends on execution)
+        expected_profit = borrow_amount * deviation * Decimal("0.5")
+        
+        # Check leverage impact
+        if state.debt_ratio > Decimal("0.5"):
+            leverage_impact = "Reduces leverage (healthy)"
+        else:
+            leverage_impact = "Increases leverage (monitor)"
+        
+        return ArbitrageOpportunity(
+            direction=direction,
+            pool_price=pool_price,
+            market_price=market_price,
+            price_deviation_pct=deviation,
+            borrow_asset=borrow_asset,
+            borrow_amount=borrow_amount,
+            expected_profit=expected_profit,
+            leverage_impact=leverage_impact,
+        )
+    
+    def plan_flashloan_arbitrage(
+        self,
+        terms: FlashLoanTerms,
+        market_price: Decimal,
+        tolerance: Decimal,
+    ) -> Dict:
+        """
+        Plan optimal arbitrage swaps for a flash loan.
+        
+        Returns dict with swap plan and expected profit.
+        """
+        pool_price = self.price()
+        
+        swaps: List[SwapQuote] = []
+        notes = {}
+        expected_profit = None
+        
+        # Determine profitable direction
+        if abs(pool_price - market_price) / market_price > tolerance:
+            if pool_price > market_price and terms.borrow_asset == "LUSDt":
+                # Buy BTC from pool (cheaper than market)
+                # Use borrowed USDT to buy BTC
+                try:
+                    quote = self.quote_swap("LUSDt", terms.borrow_amount * Decimal("0.9"))
+                    swaps.append(quote)
+                    # Profit = market value of BTC received - USDT spent
+                    btc_received = quote.amount_out
+                    usdt_spent = quote.amount_in
+                    expected_profit = (btc_received * market_price) - usdt_spent - terms.fee_amount
+                    notes["strategy"] = "Buy BTC from pool (underpriced vs market)"
+                except ValueError as e:
+                    notes["error"] = str(e)
+            elif pool_price < market_price and terms.borrow_asset == "LBTC":
+                # Sell BTC to pool (more expensive than market)
+                try:
+                    quote = self.quote_swap("LBTC", terms.borrow_amount * Decimal("0.9"))
+                    swaps.append(quote)
+                    # Profit = USDT received - market value of BTC sold
+                    usdt_received = quote.amount_out
+                    btc_sold = quote.amount_in
+                    expected_profit = usdt_received - (btc_sold * market_price) - terms.fee_amount
+                    notes["strategy"] = "Sell BTC to pool (overpriced vs market)"
+                except ValueError as e:
+                    notes["error"] = str(e)
+            else:
+                notes["info"] = "No profitable arbitrage path with this asset"
+        else:
+            notes["info"] = "Pool price within tolerance"
+        
+        return {
+            "swaps": swaps,
+            "expected_profit": expected_profit,
+            "notes": notes,
+        }
     
     # ========================================================================
     # LEVERAGE ADJUSTMENT (Via flash loan arbitrage)
@@ -425,6 +640,9 @@ class YieldBasisAMM:
         else:
             raise ValueError(f"Unknown direction: {direction}")
         
+        # Sync reserves dict
+        self.reserves["LUSDt"] = self.lusdt_reserve
+        
         # Verify covenant after adjustment
         state = self.get_state()
         if not state.is_healthy:
@@ -445,6 +663,72 @@ class YieldBasisAMM:
         new_state = self.get_state()
         
         return (old_state, new_state)
+    
+    # ========================================================================
+    # SIMULATION HELPERS
+    # ========================================================================
+    
+    def apply_simulated_pset(self, payload: Dict) -> Dict:
+        """
+        Apply a simulated PSET transaction.
+        
+        Used by liquid_utils for simulation testing.
+        """
+        pset_type = payload.get("type")
+        
+        if pset_type == "swap":
+            swap_data = payload["swap"]
+            quote = self.execute_swap(
+                swap_data["input_asset"],
+                Decimal(swap_data["amount_in"])
+            )
+            return {
+                "txid": f"swap_{uuid4().hex[:16]}",
+                "amount_in": str(quote.amount_in),
+                "amount_out": str(quote.amount_out),
+                "fee_collected": str(quote.fee_paid),
+            }
+        
+        elif pset_type == "flashloan":
+            loan_data = payload["flashloan"]
+            loan_id = loan_data["loan_id"]
+            
+            # Execute planned swaps
+            for swap_plan in payload.get("swaps", []):
+                self.execute_swap(
+                    swap_plan["input_asset"],
+                    Decimal(swap_plan["amount_in"])
+                )
+            
+            # Complete loan
+            repay_amount = Decimal(loan_data["repay_amount"])
+            fee = self.complete_flashloan(loan_id, repay_amount)
+            
+            return {
+                "txid": f"flashloan_{uuid4().hex[:16]}",
+                "loan_id": loan_id,
+                "repay_amount": str(repay_amount),
+                "fee_collected": str(fee),
+            }
+        
+        else:
+            raise ValueError(f"Unknown PSET type: {pset_type}")
+
+
+# =============================================================================
+# GLOBAL POOL INSTANCE (for compatibility with existing code)
+# =============================================================================
+
+SIMULATED_POOL = YieldBasisAMM(
+    initial_lbtc=Decimal("1.0"),
+    initial_lusdt=Decimal("30000"),
+    btc_price=Decimal("30000"),
+    swap_fee_bps=30,
+    flash_fee_bps=5,
+)
+
+# Alias for flashloan.py compatibility
+ENHANCED_POOL = SIMULATED_POOL
 
 
 # =============================================================================
@@ -478,7 +762,7 @@ def example_arbitrage_rebalancing():
     old_state, new_state = pool.update_price(Decimal("35000"))
     print(f"   Old ratio: {old_state.debt_ratio * 100:.2f}%")
     print(f"   New ratio: {new_state.debt_ratio * 100:.2f}%")
-    print(f"   Arbitrage opportunity: {new_state.arbitrage_opportunity}")
+    print(f"   Arbitrage signal: {new_state.arbitrage_signal}")
     
     # 3. Arbitrageur profits by restoring target ratio
     print("\n3. ARBITRAGEUR REBALANCES (via flash loan):")
