@@ -1,117 +1,175 @@
-"""Asynchronous rebalancer that demonstrates Bitfinex-backed arbitrage."""
+"""
+Rebalance monitoring service - EXAMPLE arbitrage bot.
 
-from __future__ import annotations
+This is NOT required infrastructure. It's an EXAMPLE showing how
+arbitrageurs can profit from maintaining the 50% debt ratio.
+
+In production, any external party can run their own bot or manually
+execute rebalancing trades via the flash loan API.
+"""
 
 import asyncio
 import logging
 from decimal import Decimal
 
-from .amm_contract import SIMULATED_POOL
-from .bfx_client import bfx_client
-from .config import CONFIG
-from .liquid_utils import (
-    build_flashloan_pset,
-    decode_simulation_pset,
-    fetch_pool_state,
-    sign_and_send_pset,
-)
+# FIXED: Use absolute imports
+import amm_contract
+import bfx_client
+import config
+import liquid_utils
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# Global references
+SIMULATED_POOL = amm_contract.SIMULATED_POOL
+bfx_client_instance = bfx_client.bfx_client
+CONFIG = config.CONFIG
+
 
 async def rebalance_loop() -> None:
-    """Continuously monitor the pool and execute simulated arbitrage trades."""
-
-    target_price = CONFIG.btc_usd_price
-    tolerance = Decimal(CONFIG.price_tolerance_bps) / Decimal(10_000)
+    """
+    Example rebalancing bot that monitors pool and executes arbitrage.
+    
+    This demonstrates how arbitrageurs profit from YieldBasis rebalancing:
+    1. Detect deviation from 50% debt ratio
+    2. Borrow via flash loan
+    3. Add/remove debt to restore ratio
+    4. Profit from the rebalancing
+    5. Repay flash loan + fee
+    """
+    
     poll_interval = CONFIG.rebalance_poll_interval_seconds
-
+    
+    logger.info("🤖 Starting example rebalancing bot...")
+    logger.info("   Current BTC price: $%s", SIMULATED_POOL.btc_price)
+    logger.info("   Poll interval: %s seconds", poll_interval)
+    
     while True:
-        state = fetch_pool_state()
-        lb_tc = Decimal(state[CONFIG.pool_asset_a])
-        l_usd = Decimal(state[CONFIG.pool_asset_b])
+        state = liquid_utils.fetch_pool_state()
+        lbtc = Decimal(state[CONFIG.pool_asset_a])
+        lusdt = Decimal(state[CONFIG.pool_asset_b])
         pool_price = Decimal(state["price"])
-        value_btc_usd = lb_tc * target_price
-        total_value = value_btc_usd + l_usd
-        ratio = value_btc_usd / total_value if total_value > 0 else Decimal(0)
+        
+        leverage_state = SIMULATED_POOL.get_leverage_state()
+        
         logger.info(
-            "Pool reserves: %s %s / %s %s | price %s | ratio %.4f",
-            _serialize(lb_tc),
-            CONFIG.pool_asset_a,
-            _serialize(l_usd),
-            CONFIG.pool_asset_b,
-            _serialize(pool_price),
-            ratio,
+            "📊 Pool: %s BTC / $%s USDT | Price: $%s | Ratio: %.2f%%",
+            lbtc,
+            lusdt,
+            pool_price,
+            leverage_state.debt_ratio * 100,
         )
-
-        opportunity = SIMULATED_POOL.arbitrage_opportunity(target_price, tolerance)
+        
+        # Check for rebalancing opportunity
+        opportunity = SIMULATED_POOL.detect_rebalance_opportunity()
+        
         if opportunity:
-            logger.info("Detected arbitrage opportunity: %s", opportunity.to_summary())
-            available = bfx_client.available_flashloan(opportunity.borrow_asset)
-            borrow_amount = min(opportunity.borrow_amount, available)
-            if borrow_amount <= 0:
-                logger.warning("Bitfinex treasury exhausted for %s", opportunity.borrow_asset)
+            logger.info("💰 ARBITRAGE DETECTED: %s", opportunity.to_summary())
+            
+            # Check Bitfinex treasury has capital
+            available = bfx_client_instance.available_flashloan(CONFIG.pool_asset_b)
+            borrow_amount = min(opportunity.debt_adjustment, available)
+            
+            if borrow_amount <= Decimal("100"):
+                logger.warning("⚠️  Insufficient Bitfinex treasury: $%s", available)
             else:
                 try:
+                    # Prepare flash loan
+                    logger.info("   Preparing flash loan for $%s...", borrow_amount)
                     terms = SIMULATED_POOL.prepare_flashloan(
-                        opportunity.borrow_asset, borrow_amount
+                        CONFIG.pool_asset_b,
+                        borrow_amount,
+                        purpose="rebalancing"
                     )
+                    
+                    # Reserve Bitfinex capital
+                    bfx_client_instance.reserve_flashloan_capital(
+                        terms.loan_id,
+                        terms.borrow_asset,
+                        terms.borrow_amount
+                    )
+                    
+                    # Plan arbitrage
+                    tolerance = Decimal(CONFIG.price_tolerance_bps) / Decimal(10_000)
+                    plan = SIMULATED_POOL.plan_flashloan_arbitrage(
+                        terms,
+                        SIMULATED_POOL.btc_price,
+                        tolerance
+                    )
+                    
+                    # Build and execute PSET
+                    pset = liquid_utils.build_flashloan_pset(
+                        terms,
+                        swaps=plan.get("swaps", []),
+                        expected_profit=plan.get("expected_profit"),
+                        notes={**plan.get("notes", {}), "initiator": "example_bot"}
+                    )
+                    
+                    decoded = liquid_utils.decode_simulation_pset(pset)
+                    
+                    # Execute rebalancing
+                    logger.info("   Executing rebalancing: %s", opportunity.action)
+                    SIMULATED_POOL.rebalance_via_flashloan(
+                        borrow_amount,
+                        opportunity.action
+                    )
+                    
+                    # Broadcast transaction
+                    result = liquid_utils.sign_and_send_pset(pset, decoded_pset=decoded)
+                    
+                    # Settle with Bitfinex
+                    details = result.details or {}
+                    repay_amount = Decimal(details.get("repay_amount", terms.repay_amount))
+                    bfx_client_instance.settle_flashloan(
+                        terms.loan_id,
+                        terms.repay_asset,
+                        repay_amount
+                    )
+                    
+                    new_state = SIMULATED_POOL.get_leverage_state()
+                    logger.info(
+                        "   ✅ Rebalanced! TX: %s | New ratio: %.2f%% | Profit: $%s",
+                        result.txid,
+                        new_state.debt_ratio * 100,
+                        plan.get("expected_profit", 0)
+                    )
+                    
                 except ValueError as exc:
-                    logger.warning("Unable to prepare flash loan: %s", exc)
-                else:
-                    try:
-                        bfx_client.reserve_flashloan_capital(
-                            terms.loan_id, terms.borrow_asset, terms.borrow_amount
-                        )
-                    except ValueError as exc:
+                    logger.error("   ❌ Rebalancing failed: %s", exc)
+                    if terms.loan_id in SIMULATED_POOL.active_loans:
                         SIMULATED_POOL.cancel_flashloan(terms.loan_id)
-                        logger.warning("Bitfinex treasury reservation failed: %s", exc)
-                    else:
-                        plan = SIMULATED_POOL.plan_flashloan_arbitrage(
-                            terms, target_price, tolerance
-                        )
-                        swaps = plan.get("swaps", [])
-                        notes = {**plan.get("notes", {}), "initiator": "rebalancer"}
-                        pset = build_flashloan_pset(
-                            terms,
-                            swaps=swaps,
-                            expected_profit=plan.get("expected_profit"),
-                            notes=notes,
-                        )
-                        decoded = decode_simulation_pset(pset)
-                        try:
-                            result = sign_and_send_pset(pset, decoded_pset=decoded)
-                        except Exception as exc:  # pragma: no cover - defensive path
-                            logger.error("Rebalance flash loan failed: %s", exc)
-                            SIMULATED_POOL.cancel_flashloan(terms.loan_id)
-                            bfx_client.cancel_flashloan_reservation(terms.loan_id)
-                        else:
-                            details = result.details or {}
-                            repay_amount = Decimal(
-                                details.get("repay_amount", terms.repay_amount)
-                            )
-                            bfx_client.settle_flashloan(
-                                terms.loan_id, terms.repay_asset, repay_amount
-                            )
-                            logger.info(
-                                "Rebalance transaction %s executed, pool price now %s",
-                                result.txid,
-                                _serialize(SIMULATED_POOL.price()),
-                            )
+                        bfx_client_instance.cancel_flashloan_reservation(terms.loan_id)
+                        
+                except Exception as exc:
+                    logger.error("   ❌ Unexpected error: %s", exc, exc_info=True)
+                    if terms.loan_id in SIMULATED_POOL.active_loans:
+                        SIMULATED_POOL.cancel_flashloan(terms.loan_id)
+                        bfx_client_instance.cancel_flashloan_reservation(terms.loan_id)
         else:
-            logger.info(
-                "Pool price %.2f within tolerance of Bitfinex %.2f",
-                pool_price,
-                target_price,
-            )
-
+            logger.info("✅ Pool balanced (ratio within 5% of target)")
+        
+        logger.info("")
         await asyncio.sleep(poll_interval)
 
 
-def _serialize(value: Decimal) -> str:
-    return format(value, "f")
-
-
-if __name__ == "__main__":  # pragma: no cover - manual execution helper
-    asyncio.run(rebalance_loop())
+if __name__ == "__main__":
+    logger.info("=" * 70)
+    logger.info("YIELDBASIS EXAMPLE REBALANCING BOT")
+    logger.info("=" * 70)
+    logger.info("")
+    logger.info("This is an EXAMPLE bot showing how arbitrageurs profit")
+    logger.info("from maintaining the 50%% debt ratio in YieldBasis.")
+    logger.info("")
+    logger.info("In production:")
+    logger.info("  - Any external party can run rebalancing bots")
+    logger.info("  - No centralized operator needed")
+    logger.info("  - Market forces maintain leverage automatically")
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("")
+    
+    try:
+        asyncio.run(rebalance_loop())
+    except KeyboardInterrupt:
+        logger.info("\n🛑 Bot stopped by user")
