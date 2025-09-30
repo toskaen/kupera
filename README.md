@@ -21,11 +21,11 @@ The repository does **not** include any governance token or incentive mechanism.
 
 | File | Description |
 | --- | --- |
-| `amm_contract.py` | High‑level description and placeholder for the Liquid covenant script.  In a real deployment this would be implemented in Liquid’s Miniscript or Elements’ `policy` language and compiled into a redeem script. |
-| `liquid_utils.py` | Helper functions to interact with a Liquid node (via JSON‑RPC), build PSETs, sign them, and broadcast transactions.  It wraps common operations such as generating addresses, estimating fees, and fetching UTXO balances. |
-| `bfx_client.py` | Simplified Bitfinex API client used by the rebalancer to borrow or repay USDT/BTC and to transfer funds between Bitfinex and Liquid.  This module does **not** implement full error handling and is meant for demonstration only. |
-| `rebalance_service.py` | Core logic for monitoring the pool and maintaining a target 50/50 value ratio.  It queries the pool’s UTXO state, compares the current BTC value to USDT value (via price feed), and rebalances using Bitfinex and on‑chain swaps if necessary. |
-| `flashloan.py` | Flask app exposing endpoints that generate PSETs for external arbitrageurs.  It uses `liquid_utils` to construct a transaction that lends L‑BTC/L‑USDT from the pool and expects repayment plus fee in the same PSET. |
+| `amm_contract.py` | Executable Bitmatrix-style AMM simulator that enforces constant-product swaps, tracks flash-loan terms, and suggests arbitrage trades using Bitfinex pricing.  Replacing this with a covenant script is a deployment detail. |
+| `liquid_utils.py` | Convenience layer that converts AMM quotes into base64 “PSET-like” payloads, decodes simulated transactions, and falls back to Elements RPC if you connect a real node. |
+| `bfx_client.py` | Simulated Bitfinex treasury with reservation/settlement logic so flash loans draw from an operator-provided USDT buffer rather than P2P credit. |
+| `rebalance_service.py` | Async loop that continuously checks the AMM price versus Bitfinex, automatically spins up a flash loan, and closes it to demonstrate how the pool stays balanced. |
+| `flashloan.py` | Flask API that any external party can call to reserve Bitfinex capital, receive an arbitrage PSET template, and submit the completed trade for settlement. |
 | `config.py` | Central configuration dataclass for API keys, Liquid RPC connection, Bitfinex API credentials, pool parameters, and fee settings. |
 | `README.md` | This file. |
 
@@ -34,7 +34,8 @@ The repository does **not** include any governance token or incentive mechanism.
 1. **Install dependencies:** `pip install -r requirements.txt` (requires Python 3.10+).
 2. **Start a Liquid node:** run `elementsd` configured for Liquid.  Ensure RPC is enabled and accessible.
 3. **Fund the pool:** use `liquid_utils` to peg‑in BTC and USDT to Liquid and deposit equal value into the covenant UTXO.  You must also fund your Bitfinex account with USDT/BTC for rebalancing.
-4. **Start the orchestrator:** run `python rebalance_service.py`.  The service will monitor the pool and Bitfinex and maintain the 2× BTC exposure by rebalancing.
-5. **Start the flashloan API:** run `python flashloan.py` to allow external arbitrageurs to borrow capital and arbitrage the pool.  They will return borrowed tokens plus a fee in the same PSET, which accrues to your pool.
+4. **Start the orchestrator:** run `python rebalance_service.py`.  The service now spins simulated flash loans backed by Bitfinex treasury capital whenever the AMM price drifts beyond the configured tolerance and settles them within the same loop.
+5. **Start the flashloan API:** run `python flashloan.py` to allow external arbitrageurs to borrow capital and arbitrage the pool.  Each request reserves Bitfinex USDT, returns a base64 payload describing the swap/repay steps, and releases the reservation when the signed transaction is submitted.
+6. **Test an arbitrage round-trip:** `curl -X POST localhost:8000/flashloan/request -d '{"asset":"LUSDt","amount":"1000"}'` to obtain a template, add your swap details, then `POST` the completed payload back to `/flashloan/submit`.  The simulator will verify repayment, accrue fees to LPs, and top the Bitfinex treasury back up.
 
 This MVP is a starting point.  To participate in the Lugano Plan ₿ pitch competition, focus on explaining how this design brings **impermanent‑loss‑free BTC yield** to Liquid.  The core innovation is marrying Liquid’s covenant‑based AMM with off‑chain leverage and PSET‑based flash loans so that anyone can arbitrage the pool and thus keep it efficient.  The next sections contain the code skeletons for each module.

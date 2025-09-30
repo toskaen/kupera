@@ -35,16 +35,23 @@ class Config:
     pool_asset_a: str = os.environ.get("POOL_ASSET_A", "LBTC")  # primary asset (BTC)
     pool_asset_b: str = os.environ.get("POOL_ASSET_B", "LUSDt")  # secondary asset (stablecoin)
     fee_bps: int = int(os.environ.get("POOL_FEE_BPS", 30))  # fee in basis points (0.30%)
+    flashloan_fee_bps: int = int(os.environ.get("FLASHLOAN_FEE_BPS", 5))  # 0.05%
+    initial_lbtc_reserve: Decimal = Decimal(os.environ.get("INITIAL_LBTC_RESERVE", "1"))
+    initial_lusdt_reserve: Decimal = Decimal(os.environ.get("INITIAL_LUSDT_RESERVE", "30000"))
+    max_flashloan_ratio: Decimal = Decimal(os.environ.get("MAX_FLASHLOAN_RATIO", "0.3"))
 
     # Rebalancing parameters
     target_ratio: Decimal = Decimal(os.environ.get("TARGET_RATIO", "0.5"))
     rebalance_threshold: Decimal = Decimal(os.environ.get("REBALANCE_THRESHOLD", "0.05"))
-
-    # Flash‑loan parameters
-    flashloan_fee_bps: int = int(os.environ.get("FLASHLOAN_FEE_BPS", 5))  # 0.05%
+    rebalance_poll_interval_seconds: int = int(os.environ.get("REBALANCE_POLL_INTERVAL", "30"))
+    price_tolerance_bps: int = int(os.environ.get("PRICE_TOLERANCE_BPS", "10"))
 
     # Price feed (could be replaced with an oracle)
     btc_usd_price: Decimal = Decimal(os.environ.get("BTC_USD_PRICE", "30000"))
+
+    # Bitfinex treasury used to bootstrap flash loans
+    bitfinex_prep_capital_usdt: Decimal = Decimal(os.environ.get("BITFINEX_PRECAP_USDT", "100000"))
+    bitfinex_prep_capital_lbtc: Decimal = Decimal(os.environ.get("BITFINEX_PRECAP_LBTC", "0"))
 
 
 CONFIG = Config()

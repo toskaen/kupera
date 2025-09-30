@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import time
+from decimal import Decimal
 from typing import Any, Dict
 
 import requests
@@ -33,6 +34,11 @@ class BitfinexClient:
     def __init__(self, api_key: str, api_secret: str) -> None:
         self.api_key = api_key
         self.api_secret = api_secret.encode("utf-8")
+        self.treasury: Dict[str, Decimal] = {
+            CONFIG.pool_asset_a: CONFIG.bitfinex_prep_capital_lbtc,
+            CONFIG.pool_asset_b: CONFIG.bitfinex_prep_capital_usdt,
+        }
+        self.outstanding_flashloans: Dict[str, Dict[str, Decimal]] = {}
 
     def _nonce(self) -> str:
         return str(int(time.time() * 1000))
@@ -52,8 +58,8 @@ class BitfinexClient:
         """Return a simplified mapping of currency codes to balances."""
         # In production use the v2 /auth/r/wallets endpoint
         logger.debug("Fetching Bitfinex balances")
-        # Placeholder stub returning static values
-        return {"BTC": 1.0, "USDT": 30000.0}
+        # Placeholder stub returning the simulated treasury values
+        return {asset: float(balance) for asset, balance in self.treasury.items()}
 
     def place_order(self, symbol: str, amount: float, price: float, side: str) -> Dict[str, Any]:
         """Place a limit order on Bitfinex.
@@ -84,6 +90,74 @@ class BitfinexClient:
         """Retrieve the deposit address for the given currency and network."""
         logger.debug("Fetching deposit address for %s on %s", currency, network)
         return "VJLdummydepositaddress"
+
+    # ------------------------------------------------------------------
+    # Simulation helpers for flash loans / treasury movements
+    # ------------------------------------------------------------------
+
+    def available_flashloan(self, asset: str) -> Decimal:
+        return self.treasury.get(asset, Decimal(0))
+
+    def reserve_flashloan_capital(self, loan_id: str, asset: str, amount: Decimal) -> None:
+        amount = Decimal(amount)
+        if amount <= 0:
+            raise ValueError("Flash loan reservation must be positive")
+        available = self.available_flashloan(asset)
+        if amount > available:
+            raise ValueError(
+                f"Insufficient Bitfinex treasury for {asset}: requested {amount}, have {available}"
+            )
+        self.treasury[asset] = available - amount
+        self.outstanding_flashloans[loan_id] = {"asset": asset, "amount": amount}
+
+    def settle_flashloan(self, loan_id: str, asset: str, repay_amount: Decimal) -> None:
+        repay_amount = Decimal(repay_amount)
+        outstanding = self.outstanding_flashloans.pop(loan_id, None)
+        if outstanding is None:
+            logger.warning("Attempted to settle unknown flash loan %s", loan_id)
+            self.treasury[asset] = self.treasury.get(asset, Decimal(0)) + repay_amount
+            return
+        expected_asset = outstanding["asset"]
+        if expected_asset != asset:
+            logger.warning("Flash loan asset mismatch for %s: %s vs %s", loan_id, expected_asset, asset)
+        self.treasury[asset] = self.treasury.get(asset, Decimal(0)) + repay_amount
+        logger.info(
+            "Settled Bitfinex flash loan %s on %s. Treasury now %s",
+            loan_id,
+            asset,
+            self.treasury[asset],
+        )
+
+    def provide_liquidity(self, asset: str, amount: Decimal) -> None:
+        amount = Decimal(amount)
+        if amount <= 0:
+            return
+        available = self.available_flashloan(asset)
+        if amount > available:
+            raise ValueError("Insufficient treasury to provide liquidity")
+        self.treasury[asset] = available - amount
+        logger.info("Allocated %s %s from Bitfinex treasury to the pool", amount, asset)
+
+    def reclaim_liquidity(self, asset: str, amount: Decimal) -> None:
+        amount = Decimal(amount)
+        if amount <= 0:
+            return
+        self.treasury[asset] = self.treasury.get(asset, Decimal(0)) + amount
+        logger.info("Returned %s %s to Bitfinex treasury", amount, asset)
+
+    def cancel_flashloan_reservation(self, loan_id: str) -> None:
+        reservation = self.outstanding_flashloans.pop(loan_id, None)
+        if not reservation:
+            return
+        asset = reservation["asset"]
+        amount = reservation["amount"]
+        self.treasury[asset] = self.treasury.get(asset, Decimal(0)) + amount
+        logger.info(
+            "Cancelled flash loan %s reservation, returning %s %s to treasury",
+            loan_id,
+            amount,
+            asset,
+        )
 
 
 bfx_client = BitfinexClient(CONFIG.bitfinex_api_key, CONFIG.bitfinex_api_secret)

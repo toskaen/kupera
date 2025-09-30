@@ -1,26 +1,4 @@
-"""
-Rebalancing service for the YieldBasis‑on‑Liquid MVP.
-
-This script monitors the state of the pool and Bitfinex balances to
-maintain a 50/50 value split between L‑BTC and L‑USDT while keeping
-the LP’s net position at 2× BTC exposure (no impermanent loss).  It
-periodically checks the pool balances, compares the current BTC value
-to the USDT side using a price feed, and initiates rebalances when the
-ratio deviates beyond a configured threshold.  Rebalancing actions
-include:
-
-* Borrowing USDT from Bitfinex (if configured) and adding it to the
-  pool when BTC appreciates relative to USD.
-* Withdrawing excess USDT from the pool and repaying Bitfinex debt
-  when BTC depreciates.
-* Opening hedging positions on Bitfinex (e.g., selling/buying BTC) to
-  neutralize the operator’s net BTC exposure as needed.
-
-For simplicity, this MVP uses stub functions in `liquid_utils` and
-`bfx_client` to represent on‑chain and off‑chain operations.  The
-`rebalance` coroutine shows the high‑level steps that a complete
-implementation would take.
-"""
+"""Asynchronous rebalancer that demonstrates Bitfinex-backed arbitrage."""
 
 from __future__ import annotations
 
@@ -28,74 +6,112 @@ import asyncio
 import logging
 from decimal import Decimal
 
-from .config import CONFIG
-from .liquid_utils import fetch_pool_state, build_swap_pset, sign_and_send_pset
+from .amm_contract import SIMULATED_POOL
 from .bfx_client import bfx_client
+from .config import CONFIG
+from .liquid_utils import (
+    build_flashloan_pset,
+    decode_simulation_pset,
+    fetch_pool_state,
+    sign_and_send_pset,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
 async def rebalance_loop() -> None:
-    """
-    Continuously monitor the pool and perform rebalancing when needed.
+    """Continuously monitor the pool and execute simulated arbitrage trades."""
 
-    In each iteration we:
-    1. Fetch the current on‑chain pool state (LBTC and LUSDT balances).
-    2. Compute the USD value of the BTC side using a price feed.
-    3. Determine the deviation from the target ratio (e.g. 50/50).
-    4. If deviation exceeds the threshold, perform an off‑chain trade on
-       Bitfinex and adjust the on‑chain pool using a PSET swap.
-    5. Sleep for a configured interval and repeat.
-    """
-    price_btc_usd = CONFIG.btc_usd_price
-    threshold = CONFIG.rebalance_threshold
-    ratio_target = CONFIG.target_ratio
+    target_price = CONFIG.btc_usd_price
+    tolerance = Decimal(CONFIG.price_tolerance_bps) / Decimal(10_000)
+    poll_interval = CONFIG.rebalance_poll_interval_seconds
 
     while True:
         state = fetch_pool_state()
-        lb_tc = Decimal(state["lb_tc_balance"])
-        l_usd = Decimal(state["lusdt_balance"])
-        # Compute values in USD
-        value_btc_usd = lb_tc * price_btc_usd
-        value_usdt = l_usd  # USDT assumed pegged
-        total_value = value_btc_usd + value_usdt
-        current_ratio = value_btc_usd / total_value if total_value > 0 else Decimal(0)
-        deviation = current_ratio - ratio_target
+        lb_tc = Decimal(state[CONFIG.pool_asset_a])
+        l_usd = Decimal(state[CONFIG.pool_asset_b])
+        pool_price = Decimal(state["price"])
+        value_btc_usd = lb_tc * target_price
+        total_value = value_btc_usd + l_usd
+        ratio = value_btc_usd / total_value if total_value > 0 else Decimal(0)
         logger.info(
-            "Pool state: %.8f LBTC ($%.2f) and %.2f LUSDT, ratio %.4f",
-            lb_tc, value_btc_usd, l_usd, current_ratio
+            "Pool reserves: %s %s / %s %s | price %s | ratio %.4f",
+            _serialize(lb_tc),
+            CONFIG.pool_asset_a,
+            _serialize(l_usd),
+            CONFIG.pool_asset_b,
+            _serialize(pool_price),
+            ratio,
         )
-        if deviation > threshold:
-            # BTC side too high – borrow USDT from Bitfinex and add to pool
-            needed_value = (ratio_target - current_ratio) * total_value
-            amount_usdt_needed = needed_value  # 1:1 USD
-            logger.info(
-                "BTC side over target by %.2f%%, adding %.2f USDT to pool",
-                deviation * 100, amount_usdt_needed
-            )
-            # Borrow USDT or use treasury
-            bfx_client.place_order("tBTCUSD", 0, 0, "sell")  # placeholder
-            # Create and sign a PSET adding USDT to the pool (not implemented)
-            pset = build_swap_pset([], 0, 0, 0)
-            sign_and_send_pset(pset)
-        elif deviation < -threshold:
-            # BTC side too low – withdraw USDT from pool and repay Bitfinex
-            needed_value = (ratio_target - current_ratio) * total_value
-            amount_usdt_removed = -needed_value
-            logger.info(
-                "BTC side under target by %.2f%%, removing %.2f USDT from pool",
-                -deviation * 100, amount_usdt_removed
-            )
-            # Sell BTC on Bitfinex to repay USDT debt
-            bfx_client.place_order("tBTCUSD", 0, 0, "buy")  # placeholder
-            pset = build_swap_pset([], 0, 0, 0)
-            sign_and_send_pset(pset)
+
+        opportunity = SIMULATED_POOL.arbitrage_opportunity(target_price, tolerance)
+        if opportunity:
+            logger.info("Detected arbitrage opportunity: %s", opportunity.to_summary())
+            available = bfx_client.available_flashloan(opportunity.borrow_asset)
+            borrow_amount = min(opportunity.borrow_amount, available)
+            if borrow_amount <= 0:
+                logger.warning("Bitfinex treasury exhausted for %s", opportunity.borrow_asset)
+            else:
+                try:
+                    terms = SIMULATED_POOL.prepare_flashloan(
+                        opportunity.borrow_asset, borrow_amount
+                    )
+                except ValueError as exc:
+                    logger.warning("Unable to prepare flash loan: %s", exc)
+                else:
+                    try:
+                        bfx_client.reserve_flashloan_capital(
+                            terms.loan_id, terms.borrow_asset, terms.borrow_amount
+                        )
+                    except ValueError as exc:
+                        SIMULATED_POOL.cancel_flashloan(terms.loan_id)
+                        logger.warning("Bitfinex treasury reservation failed: %s", exc)
+                    else:
+                        plan = SIMULATED_POOL.plan_flashloan_arbitrage(
+                            terms, target_price, tolerance
+                        )
+                        swaps = plan.get("swaps", [])
+                        notes = {**plan.get("notes", {}), "initiator": "rebalancer"}
+                        pset = build_flashloan_pset(
+                            terms,
+                            swaps=swaps,
+                            expected_profit=plan.get("expected_profit"),
+                            notes=notes,
+                        )
+                        decoded = decode_simulation_pset(pset)
+                        try:
+                            result = sign_and_send_pset(pset, decoded_pset=decoded)
+                        except Exception as exc:  # pragma: no cover - defensive path
+                            logger.error("Rebalance flash loan failed: %s", exc)
+                            SIMULATED_POOL.cancel_flashloan(terms.loan_id)
+                            bfx_client.cancel_flashloan_reservation(terms.loan_id)
+                        else:
+                            details = result.details or {}
+                            repay_amount = Decimal(
+                                details.get("repay_amount", terms.repay_amount)
+                            )
+                            bfx_client.settle_flashloan(
+                                terms.loan_id, terms.repay_asset, repay_amount
+                            )
+                            logger.info(
+                                "Rebalance transaction %s executed, pool price now %s",
+                                result.txid,
+                                _serialize(SIMULATED_POOL.price()),
+                            )
         else:
-            logger.info("Pool ratio within threshold (%.4f), no rebalance needed", current_ratio)
-        # Sleep before next check
-        await asyncio.sleep(60)
+            logger.info(
+                "Pool price %.2f within tolerance of Bitfinex %.2f",
+                pool_price,
+                target_price,
+            )
+
+        await asyncio.sleep(poll_interval)
 
 
-if __name__ == "__main__":
+def _serialize(value: Decimal) -> str:
+    return format(value, "f")
+
+
+if __name__ == "__main__":  # pragma: no cover - manual execution helper
     asyncio.run(rebalance_loop())
